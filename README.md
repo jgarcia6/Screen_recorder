@@ -4,7 +4,7 @@
 
 This repository contains a Python script for a screen recorder that takes a screenshot every second and condenses them into a video at 4 frames per second (FPS), creating a timelapse of desktop activity.
 
-Output file will be tagged with the timestamp of when the recording started and the public IP (if it can be resolved) of the host.
+Output file will be tagged with the timestamp of when the recording started and the external IP (if it can be resolved, otherwise it will use the internal one) of the host as 8 hexadecimal characters (2 for each octet).
 
 ## Requirements
 

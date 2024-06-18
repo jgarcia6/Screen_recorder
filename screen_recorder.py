@@ -3,6 +3,8 @@ import subprocess
 import sys
 import urllib.request
 from datetime import datetime
+import re
+import signal
 
 def install(package):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
@@ -28,6 +30,11 @@ try:
 except ImportError:
     install("socket")
     import socket
+try:
+    import requests
+except ImportError:
+    install("requests")
+    import requests
 
 def take_screenshot():
     # Capture the screen
@@ -38,11 +45,41 @@ def take_screenshot():
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     return frame
 
+def get_external_ip():
+    services = [
+        'https://api.ipify.org?format=json',
+        'https://httpbin.org/ip',
+        'https://ipinfo.io/ip',
+        'https://ifconfig.me/ip',
+        'https://ident.me'
+    ]
+
+    for service in services:
+        try:
+            response = requests.get(service)
+            response.raise_for_status()
+            
+            if 'ip' in response.json():  # For JSON responses
+                return response.json()['ip']
+            else:  # For plain text responses
+                return response.text.strip()
+        
+        except requests.RequestException as e:
+            print(f"Error fetching from {service}: {e}")
+    
+    return None
+
 def get_ip_address():
-    # Get the hostname of the machine
-    hostname = socket.gethostname()
-    # Get the IP address using the hostname
-    ip_address = socket.gethostbyname(hostname)
+    ip_address = get_external_ip()
+    if not ip_address:
+        try:
+            # Get the hostname of the machine
+            hostname = socket.gethostname()
+            # Get the IP address using the hostname
+            ip_address = socket.gethostbyname(hostname)
+        except Exception as e:
+            ip_address = '00000000'
+
     return ip_address
     #external_ip = urllib.request.urlopen('https://v4.ident.me/ ').read().decode('utf8')
     #return external_ip
@@ -51,7 +88,7 @@ def convert_ip_to_hex(ip_address):
     # Split the IP address into its components
     parts = ip_address.split('.')
     # Convert each part to hexadecimal and remove the '0x' prefix
-    hex_parts = [format(int(part), '02x') for part in parts]
+    hex_parts = [format(int(part), '02X') for part in parts]
     # Join the hexadecimal parts together with no spaces
     hex_ip = ''.join(hex_parts)
     return hex_ip
@@ -76,9 +113,15 @@ def create_tagged_filename(base_filename):
 
 def main():
     # Define the codec and create VideoWriter object
-    codec = 'XVID' #H264,XVID
+    codec = 'XVID' # Use 'XVID' for portability. Use 'H264' best compression, but host needs to have ffmpeg installed
     videoExtension = '.avi'
-    videoName = create_tagged_filename('timelapse')
+
+    user_input = input("Introduce tu matrícula:")
+    pattern = re.compile(r'[^a-zA-Z0-9]')
+    # Use the sub() function to replace non-alphanumeric characters with an empty string
+    user_input = re.sub(pattern, '', user_input)
+    videoName = create_tagged_filename(user_input)
+
     fourcc = cv2.VideoWriter_fourcc(*codec)
     if codec == 'H264':
         videoExtension = '.mp4'
@@ -86,7 +129,18 @@ def main():
     fps = 4
     frame_size = pyautogui.size()
     out = cv2.VideoWriter(videoName+videoExtension, fourcc, fps, frame_size)
-    print("Recording started...")
+
+    # Trying to prevent corruption of file by handling gracefully a sudden termination
+    def signal_handler(sig, frame):
+        print('Grabación temrinada por el usuario.')
+        out.release()
+        cv2.destroyAllWindows()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    
+    print("Iniciando grabación...")
+    print("Presiona 'CTRL+C' para terminar.")
     try:
         while True:
             frame = take_screenshot()
@@ -94,7 +148,7 @@ def main():
             # Wait for 1 second before taking the next screenshot
             time.sleep(1)
     except KeyboardInterrupt:
-        print("Stopped by user")
+        print('Grabación temrinada por el usuario.')
     finally:
         out.release()
         cv2.destroyAllWindows()
