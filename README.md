@@ -25,6 +25,8 @@ python screen_recorder.py
 
 4. Find the generated timelapse.avi video in the same directory.
 
+5. Alternatively, an __Bold__ exectuable can be found inside the __Bold__ dist  folder.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a pull request or open an issue if you have any suggestions or improvements.
