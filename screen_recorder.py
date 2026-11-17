@@ -1,157 +1,228 @@
-import time
+"""Grabador de examen: ventana pequeña con matrícula, aviso de grabación y botón Detener.
+
+La captura, el troceado y la subida a Drive están en recorder_core.py.
+Configuración: config.json junto a este archivo (o junto al .exe).
+"""
+import os
+import queue
 import subprocess
 import sys
-import urllib.request
-from datetime import datetime
-import re
-import signal
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import font as tkfont
+from tkinter import messagebox, ttk
 
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+from recorder_core import Recorder, load_config, sanitize_id
 
-try:
-    import pyautogui
-except ImportError:
-    install("pyautogui")
-    install("pillow")
-    import pyautogui
-try:
-    import cv2
-except ImportError:
-    install("opencv-python")
-    import cv2
-try:
-    import numpy as np
-except ImportError:
-    install("numpy")
-    import numpy as np
-try:
-    import socket
-except ImportError:
-    install("socket")
-    import socket
-try:
-    import requests
-except ImportError:
-    install("requests")
-    import requests
+RED, GREEN, ORANGE, GREY = "#b00020", "#1b7f3b", "#b35c00", "#444444"
 
-def take_screenshot():
-    # Capture the screen
-    screenshot = pyautogui.screenshot()
-    # Convert the screenshot to a numpy array
-    frame = np.array(screenshot)
-    # Convert the color from BGR to RGB
-    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    return frame
 
-def get_external_ip():
-    services = [
-        'https://api.ipify.org?format=json',
-        'https://httpbin.org/ip',
-        'https://ipinfo.io/ip',
-        'https://ifconfig.me/ip',
-        'https://ident.me'
-    ]
+def base_dir():
+    if getattr(sys, "frozen", False):  # empaquetado con PyInstaller
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
 
-    for service in services:
+
+def open_folder(path):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError:
+        pass
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("Grabador de examen")
+        root.resizable(False, False)
+
         try:
-            response = requests.get(service)
-            response.raise_for_status()
-            
-            if 'ip' in response.json():  # For JSON responses
-                return response.json()['ip']
-            else:  # For plain text responses
-                return response.text.strip()
-        
-        except requests.RequestException as e:
-            print(f"Error fetching from {service}: {e}")
-    
-    return None
-
-def get_ip_address():
-    ip_address = get_external_ip()
-    if not ip_address:
-        try:
-            # Get the hostname of the machine
-            hostname = socket.gethostname()
-            # Get the IP address using the hostname
-            ip_address = socket.gethostbyname(hostname)
+            self.cfg = load_config(base_dir())
         except Exception as e:
-            ip_address = '00000000'
+            messagebox.showerror("Configuración", f"No se pudo leer config.json:\n{e}")
+            root.destroy()
+            raise SystemExit(1)
 
-    return ip_address
-    #external_ip = urllib.request.urlopen('https://v4.ident.me/ ').read().decode('utf8')
-    #return external_ip
+        self.events = queue.Queue()
+        self.rec = None
+        self.state = "idle"
+        self.t0 = None
+        self.warning = ""
+        self.pending_dir = None
 
-def convert_ip_to_hex(ip_address):
-    # Split the IP address into its components
-    parts = ip_address.split('.')
-    # Convert each part to hexadecimal and remove the '0x' prefix
-    hex_parts = [format(int(part), '02X') for part in parts]
-    # Join the hexadecimal parts together with no spaces
-    hex_ip = ''.join(hex_parts)
-    return hex_ip
+        bold = tkfont.nametofont("TkDefaultFont").copy()
+        bold.configure(weight="bold", size=11)
 
-def get_timestamp():
-    # Get the current date and time
-    current_time = datetime.now()
-    # Format the timestamp
-    timestamp = current_time.strftime('%Y-%m-%d_%H-%M-%S')
-    return timestamp
+        frm = ttk.Frame(root, padding=16)
+        frm.grid()
+        ttk.Label(frm, text="Matrícula:").grid(row=0, column=0, sticky="w")
+        self.id_var = tk.StringVar()
+        self.entry = ttk.Entry(frm, textvariable=self.id_var, width=28)
+        self.entry.grid(row=1, column=0, pady=(2, 10), sticky="ew")
+        self.entry.bind("<Return>", lambda _e: self.start())
+        self.btn = ttk.Button(frm, text="Iniciar grabación", command=self.start)
+        self.btn.grid(row=2, column=0, sticky="ew")
+        self.status = tk.Label(frm, text="", font=bold, wraplength=330, justify="left", anchor="w")
+        self.status.grid(row=3, column=0, pady=(14, 0), sticky="w")
+        self.detail = tk.Label(frm, text="", wraplength=330, justify="left", anchor="w", fg=GREY)
+        self.detail.grid(row=4, column=0, pady=(4, 0), sticky="w")
+        self.folder_btn = ttk.Button(frm, text="Abrir carpeta", command=self.show_folder)
 
-def create_tagged_filename(base_filename):
-    # Get the IP address
-    ip_address = get_ip_address()
-    # Convert the IP address to hexadecimal
-    hex_ip = convert_ip_to_hex(ip_address)
-    # Get the timestamp
-    timestamp = get_timestamp()
-    # Create the tagged filename
-    tagged_filename = f"{base_filename}_{timestamp}_{hex_ip}"
-    return tagged_filename
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.entry.focus()
+        self.root.after(200, self.poll)
+
+    # ---- estados -------------------------------------------------------
+    def set_state(self, state):
+        self.state = state
+        self.folder_btn.grid_remove()
+        if state == "idle":
+            self.entry.config(state="normal")
+            self.btn.config(text="Iniciar grabación", command=self.start, state="normal")
+        elif state == "starting":
+            self.entry.config(state="disabled")
+            self.btn.config(state="disabled")
+            self.set_status("Iniciando…", GREY, "Preparando la grabación.")
+        elif state == "recording":
+            self.btn.config(text="Detener grabación", command=self.confirm_stop, state="normal")
+        elif state == "finishing":
+            self.btn.config(state="disabled")
+            self.set_status("Subiendo los últimos fragmentos…", ORANGE,
+                            "No cierres esta ventana ni apagues la computadora.")
+        elif state == "done":
+            self.btn.config(text="Cerrar", command=self.root.destroy, state="normal")
+
+    def set_status(self, text, color, detail=""):
+        self.status.config(text=text, fg=color)
+        self.detail.config(text=detail)
+
+    def refresh_recording_labels(self):
+        elapsed = int(time.monotonic() - self.t0)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        rec = self.rec
+        text = f"●  GRABANDO   {h:02d}:{m:02d}:{s:02d}"
+        if not rec.cfg["upload_url"]:
+            detail = "Modo local: la subida a Drive está desactivada."
+        elif self.warning:
+            detail = self.warning
+        else:
+            detail = f"Fragmentos subidos: {rec.chunks_uploaded} de {rec.chunks_total}"
+        color = RED if not self.warning else ORANGE
+        self.set_status(text, RED, "")
+        self.detail.config(text=detail, fg=color if self.warning else GREY)
+
+    # ---- acciones ------------------------------------------------------
+    def start(self):
+        if self.state != "idle":
+            return
+        student_id = self.id_var.get().strip()
+        if not sanitize_id(student_id):
+            messagebox.showwarning("Matrícula", "Escribe tu matrícula antes de iniciar.")
+            return
+        try:
+            self.rec = Recorder(self.cfg, student_id,
+                                on_event=lambda kind, data: self.events.put((kind, data)))
+            self.rec.start()
+        except Exception as e:
+            messagebox.showerror("No se pudo iniciar", str(e))
+            self.rec = None
+            return
+        self.warning = ""
+        self.set_state("starting")
+
+    def confirm_stop(self):
+        if self.state != "recording":
+            return
+        if messagebox.askyesno("Detener grabación",
+                               "¿Seguro que quieres terminar la grabación?\n"
+                               "Hazlo solo cuando hayas entregado tu examen.",
+                               icon="warning"):
+            self.rec.stop()
+            self.set_state("finishing")
+
+    def on_close(self):
+        if self.state in ("idle", "done"):
+            self.root.destroy()
+        elif self.state == "recording":
+            self.confirm_stop()
+        else:
+            messagebox.showinfo("Espera", "Espera a que termine de subir los archivos.")
+
+    def show_folder(self):
+        if self.pending_dir:
+            open_folder(self.pending_dir)
+
+    # ---- eventos del grabador -----------------------------------------
+    def poll(self):
+        try:
+            while True:
+                kind, data = self.events.get_nowait()
+                self.handle(kind, data)
+        except queue.Empty:
+            pass
+        if self.state == "recording":
+            self.refresh_recording_labels()
+        self.root.after(200, self.poll)
+
+    def handle(self, kind, data):
+        if kind == "started":
+            self.t0 = time.monotonic()
+            self.set_state("recording")
+        elif kind == "uploaded":
+            self.warning = ""
+        elif kind == "upload_failed":
+            n = data.get("pending", 0)
+            self.warning = (f"⚠ Sin conexión con el servidor: {n} fragmento(s) pendientes. "
+                            "Reintentando… revisa tu internet.")
+        elif kind == "error":
+            if self.state in ("starting", "recording"):
+                self.set_state("finishing")  # la captura ya se detuvo; solo falta subir
+            messagebox.showerror("Error de grabación", data.get("message", "Error desconocido"))
+        elif kind == "finished":
+            self.finish(data)
+
+    def finish(self, s):
+        self.set_state("done")
+        if s["chunks_total"] == 0:
+            self.set_state("idle")
+            self.set_status("No se grabó nada.", RED, "Vuelve a intentarlo.")
+            self.rec = None
+            return
+        pending = s["pending"]
+        if not pending:
+            detail = f"Todos los fragmentos ({s['chunks_total']}) se subieron correctamente."
+            if s["upload_enabled"] and not s["final_marker"]:
+                detail += "\nNo se pudo enviar la marca final; avisa a tu profesor."
+            self.set_status("✔ Grabación terminada", GREEN, detail + "\nYa puedes cerrar esta ventana.")
+            return
+        self.pending_dir = s["work_dir"]
+        if not s["upload_enabled"]:
+            why = "La subida está desactivada en config.json (modo local)."
+        else:
+            why = "No se pudieron subir (revisa tu internet)."
+        self.set_status(f"⚠ ATENCIÓN: {len(pending)} fragmento(s) sin subir", RED,
+                        f"{why}\nSe conservaron en:\n{s['work_dir']}\n"
+                        "NO borres esa carpeta y avisa a tu profesor.")
+        self.folder_btn.grid(row=5, column=0, pady=(10, 0), sticky="w")
+
 
 def main():
-    # Define the codec and create VideoWriter object
-    codec = 'XVID' # Use 'XVID' for portability. Use 'H264' best compression, but host needs to have ffmpeg installed
-    videoExtension = '.avi'
+    try:  # pantallas con escala (125 %, 150 %): capturar a resolución real
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
 
-    user_input = input("Introduce tu matrícula:")
-    pattern = re.compile(r'[^a-zA-Z0-9]')
-    # Use the sub() function to replace non-alphanumeric characters with an empty string
-    user_input = re.sub(pattern, '', user_input)
-    videoName = create_tagged_filename(user_input)
 
-    fourcc = cv2.VideoWriter_fourcc(*codec)
-    if codec == 'H264':
-        videoExtension = '.mp4'
-    # Set the desired frames per second for the output video
-    fps = 4
-    frame_size = pyautogui.size()
-    out = cv2.VideoWriter(videoName+videoExtension, fourcc, fps, frame_size)
-
-    # Trying to prevent corruption of file by handling gracefully a sudden termination
-    def signal_handler(sig, frame):
-        print('Grabación temrinada por el usuario.')
-        out.release()
-        cv2.destroyAllWindows()
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    
-    print("Iniciando grabación...")
-    print("Presiona 'CTRL+C' para terminar.")
-    try:
-        while True:
-            frame = take_screenshot()
-            out.write(frame)
-            # Wait for 1 second before taking the next screenshot
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print('Grabación temrinada por el usuario.')
-    finally:
-        out.release()
-        cv2.destroyAllWindows()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
