@@ -1,7 +1,7 @@
-"""Grabador de examen: ventana pequeña con matrícula, aviso de grabación y botón Detener.
+"""Exam recorder: small window with a student ID field, a recording notice and a Stop button.
 
-La captura, el troceado y la subida a Drive están en recorder_core.py.
-La configuración (URL, token) está en exam_settings.py y se compila dentro del .exe.
+Capture, chunking and the Drive upload live in recorder_core.py.
+Settings (URL, token) live in exam_settings.py and are compiled into the .exe.
 """
 import os
 import queue
@@ -32,7 +32,7 @@ def open_folder(path):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Grabador de examen")
+        root.title("Screen Recorder")
         root.resizable(False, False)
 
         try:
@@ -71,7 +71,7 @@ class App:
         self.entry.focus()
         self.root.after(200, self.poll)
 
-    # ---- estados -------------------------------------------------------
+    # ---- states --------------------------------------------------------
     def set_state(self, state):
         self.state = state
         self.folder_btn.grid_remove()
@@ -100,7 +100,7 @@ class App:
         h, rem = divmod(elapsed, 3600)
         m, s = divmod(rem, 60)
         rec = self.rec
-        text = f"●  GRABANDO   {h:02d}:{m:02d}:{s:02d}"
+        text = f"●  RECORDING   {h:02d}:{m:02d}:{s:02d}"
         if not rec.cfg["upload_url"]:
             detail = "Modo local: la subida a Drive está desactivada."
         elif self.warning:
@@ -111,7 +111,7 @@ class App:
         self.set_status(text, RED, "")
         self.detail.config(text=detail, fg=color if self.warning else GREY)
 
-    # ---- acciones ------------------------------------------------------
+    # ---- actions -------------------------------------------------------
     def start(self):
         if self.state != "idle":
             return
@@ -134,8 +134,7 @@ class App:
         if self.state != "recording":
             return
         if messagebox.askyesno("Detener grabación",
-                               "¿Seguro que quieres terminar la grabación?\n"
-                               "Hazlo solo cuando hayas entregado tu examen.",
+                               "¿Seguro que quieres terminar la grabación?\n",
                                icon="warning"):
             self.rec.stop()
             self.set_state("finishing")
@@ -152,7 +151,7 @@ class App:
         if self.pending_dir:
             open_folder(self.pending_dir)
 
-    # ---- eventos del grabador -----------------------------------------
+    # ---- recorder events -----------------------------------------------
     def poll(self):
         try:
             while True:
@@ -176,7 +175,7 @@ class App:
                             "Reintentando… revisa tu internet.")
         elif kind == "error":
             if self.state in ("starting", "recording"):
-                self.set_state("finishing")  # la captura ya se detuvo; solo falta subir
+                self.set_state("finishing")  # capture has already stopped; only the upload remains
             messagebox.showerror("Error de grabación", data.get("message", "Error desconocido"))
         elif kind == "finished":
             self.finish(data)
@@ -208,7 +207,7 @@ class App:
 
 
 def main():
-    try:  # pantallas con escala (125 %, 150 %): capturar a resolución real
+    try:  # scaled displays (125 %, 150 %): capture at real resolution
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:

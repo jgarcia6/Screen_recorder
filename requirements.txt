@@ -1,5 +1,2 @@
-opencv-python
-numpy
+pillow>=9.1
 requests
-pyautogui
-pillow

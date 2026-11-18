@@ -1,20 +1,25 @@
-"""Núcleo del grabador de exámenes (sin interfaz gráfica).
+"""Core of the exam screen recorder (no GUI).
 
-Toma una captura de pantalla cada `interval_s` segundos y las guarda a `fps`
-cuadros por segundo en fragmentos AVI independientes de `chunk_frames` cuadros
-(240 cuadros a 4 fps = 60 s de video = 4 min de pantalla real). Cada fragmento
-se sube a Google Drive mediante el receptor de Apps Script (receptor_drive.gs)
-y solo se borra del disco cuando el servidor confirma el tamaño y el MD5.
-Lo que no se logra subir se conserva en `work_dir` y se reporta al final.
+Takes a screenshot every `interval_s` seconds and saves them at `fps` frames per
+second into independent MP4 (H.264) chunks of `chunk_frames` frames (240 frames at
+4 fps = 60 s of video = 4 min of real screen time). Encoding is done by an ffmpeg
+executable that receives raw frames through a pipe (it is bundled into the .exe, see
+README). Each chunk is uploaded to Google Drive
+through the Apps Script receiver (drive_receiver.gs) and is deleted from disk only
+after the server confirms the size and MD5. Anything that could not be uploaded is
+kept in `work_dir` and reported at the end.
 
-La interfaz vive en screen_recorder.py; este módulo no importa tkinter.
+The GUI lives in screen_recorder.py; this module does not import tkinter.
 """
 import base64
+import collections
 import hashlib
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,24 +27,26 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import cv2
-import numpy as np
 import requests
+from PIL import Image
 
 DEFAULT_CONFIG = {
-    "upload_url": "",            # URL de la aplicación web de Apps Script; vacío = no subir
-    "token": "",                 # secreto compartido con receptor_drive.gs
-    "fps": 4,                    # cuadros por segundo del video resultante
-    "interval_s": 1.0,           # segundos entre capturas de pantalla
-    "chunk_frames": 240,         # cuadros por fragmento (240 / 4 fps = 60 s de video)
-    "scale": 1.0,                # 0.5 reduce el tamaño de los archivos a ~1/4
-    "codec": "XVID",
-    "work_dir": None,            # None = Descargas\GrabacionExamen (ver resolve_work_dir)
-    "retry_delay_s": 20,        # espera entre reintentos mientras se graba
-    "final_attempts": 3,         # pasadas de subida al detener
-    "final_wait_s": 5,           # espera entre pasadas al detener
-    "final_max_s": 180,          # tiempo máximo total de subida al detener
-    "request_timeout_s": 120,    # lectura de la respuesta del servidor
+    "upload_url": "",            # Apps Script web app URL; empty = do not upload
+    "token": "",                 # shared secret, same as in drive_receiver.gs
+    "fps": 4,                    # frames per second of the resulting video
+    "interval_s": 1.0,           # seconds between screenshots
+    "chunk_frames": 240,         # frames per chunk (240 / 4 fps = 60 s of video)
+    "scale": 1.0,                # 0.5 shrinks the files to ~1/4 of the size
+    "ffmpeg_path": None,         # None = bundled ffmpeg next to the program, then PATH
+    "crf": 28,                   # H.264 quality: lower = better and bigger (23-32 is sensible)
+    "preset": "veryfast",        # x264 speed/size trade-off
+    "gop_frames": 16,            # keyframe every N frames (an interrupted MP4 stays playable up to the last one)
+    "work_dir": None,            # None = Downloads\ExamRecording (see resolve_work_dir)
+    "retry_delay_s": 20,        # wait between retries while recording
+    "final_attempts": 3,         # upload passes when stopping
+    "final_wait_s": 5,           # wait between passes when stopping
+    "final_max_s": 180,          # maximum total upload time when stopping
+    "request_timeout_s": 120,    # read timeout for the server response
 }
 
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -50,7 +57,7 @@ _IP_SERVICES = (
 )
 
 
-APP_FOLDER = "GrabacionExamen"
+APP_FOLDER = "Screen Recorder"
 
 
 def _is_writable_dir(path):
@@ -64,7 +71,7 @@ def _is_writable_dir(path):
 
 
 def _windows_downloads_dir():
-    """Carpeta Descargas real del usuario (puede estar redirigida) según Windows."""
+    """The user's real Downloads folder as reported by Windows (may be redirected)."""
     import ctypes
     from ctypes import wintypes
 
@@ -78,10 +85,10 @@ def _windows_downloads_dir():
     shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
     shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD,
                                              wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
-    shell32.SHGetKnownFolderPath.restype = ctypes.HRESULT  # lanza OSError si falla
+    shell32.SHGetKnownFolderPath.restype = ctypes.HRESULT  # raises OSError on failure
     ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
     ptr = ctypes.c_void_p()
-    KF_FLAG_DONT_VERIFY = 0x00004000  # no tocar disco/red al resolver; _is_writable_dir lo comprueba
+    KF_FLAG_DONT_VERIFY = 0x00004000  # do not touch disk/network while resolving; _is_writable_dir checks it
     shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), KF_FLAG_DONT_VERIFY, None, ctypes.byref(ptr))
     try:
         return Path(ctypes.wstring_at(ptr.value))
@@ -90,11 +97,11 @@ def _windows_downloads_dir():
 
 
 def resolve_work_dir():
-    """Descargas\\GrabacionExamen del usuario actual, con alternativas si no sirve.
+    """Current user's Downloads\\ExamRecording, with fallbacks if it is unusable.
 
-    Orden: carpeta Descargas según Windows -> ~/Downloads -> C:\\Users\\Public.
-    Se prefiere una ruta ASCII (OpenCV puede fallar al escribir video en rutas con
-    acentos en Windows); si ninguna ASCII sirve, se usa la primera escribible.
+    Order: Downloads folder from Windows -> ~/Downloads -> C:\\Users\\Public.
+    An ASCII-only path is preferred as a precaution (some tools mishandle accents
+    on Windows); if no ASCII path works, the first writable one is used.
     """
     windows = sys.platform.startswith("win")
     candidates = []
@@ -112,20 +119,20 @@ def resolve_work_dir():
             return base / APP_FOLDER
     if usable:
         return usable[0] / APP_FOLDER
-    raise RuntimeError("No se encontró una carpeta con permiso de escritura para guardar la grabación.")
+    raise RuntimeError("No writable folder was found to store the recording.")
 
 
 def _apply(cfg, values, origin):
     for key, value in values.items():
         if key not in DEFAULT_CONFIG:
-            raise ValueError(f"Clave desconocida en {origin}: {key!r}")
+            raise ValueError(f"Unknown key in {origin}: {key!r}")
         cfg[key] = value
 
 
 def load_config(overrides=None):
-    """Valores por defecto + exam_settings.py (se compila dentro del .exe) + overrides.
+    """Defaults + exam_settings.py (compiled into the .exe) + overrides.
 
-    No lee ningún archivo externo: el .exe se distribuye solo.
+    Reads no external file: the .exe is distributed on its own.
     """
     cfg = dict(DEFAULT_CONFIG)
     try:
@@ -142,12 +149,12 @@ def load_config(overrides=None):
 
 
 def sanitize_id(text):
-    """Deja solo letras y números (igual que el script original)."""
+    """Keep only letters and digits (same as the original script)."""
     return re.sub(r"[^a-zA-Z0-9]", "", text or "")
 
 
 def get_ip_hex(timeout=3.0):
-    """IP externa (o interna si no hay red) como 8 caracteres hexadecimales."""
+    """External IP (or internal if offline) as 8 hexadecimal characters."""
     ip = None
     for url in _IP_SERVICES:
         try:
@@ -173,7 +180,7 @@ def get_ip_hex(timeout=3.0):
 
 
 class Uploader:
-    """Cliente del receptor de Apps Script. Un solo intento por llamada."""
+    """Client for the Apps Script receiver. One attempt per call."""
 
     def __init__(self, url, token, read_timeout=120):
         self.url = (url or "").strip()
@@ -187,8 +194,8 @@ class Uploader:
 
     def _post(self, payload):
         payload = dict(payload, token=self.token)
-        # Apps Script responde con 302 a otra URL; requests lo sigue con GET,
-        # que es justo lo que ese servicio espera.
+        # Apps Script answers with a 302 to another URL; requests follows it with GET,
+        # which is exactly what that service expects.
         r = self._session.post(
             self.url,
             data=json.dumps(payload).encode("utf-8"),
@@ -199,7 +206,7 @@ class Uploader:
         return r.json()
 
     def upload_chunk(self, folder, path):
-        """Devuelve (ok, detalle). ok solo si el servidor confirma tamaño y MD5."""
+        """Returns (ok, detail). ok only if the server confirms size and MD5."""
         try:
             data = Path(path).read_bytes()
             md5 = hashlib.md5(data, usedforsecurity=False).hexdigest()
@@ -215,9 +222,9 @@ class Uploader:
             return False, f"{type(e).__name__}: {e}"
         if not isinstance(resp, dict) or not resp.get("ok"):
             error = resp.get("error") if isinstance(resp, dict) else None
-            return False, f"servidor: {error or 'respuesta inválida'}"
+            return False, f"server: {error or 'invalid response'}"
         if resp.get("md5") != md5 or resp.get("size") != len(data):
-            return False, "el servidor guardó un archivo distinto (MD5/tamaño no coinciden)"
+            return False, "the server stored a different file (MD5/size mismatch)"
         return True, "ok"
 
     def send_final(self, folder, info):
@@ -226,28 +233,105 @@ class Uploader:
         except (requests.RequestException, ValueError) as e:
             return False, f"{type(e).__name__}: {e}"
         ok = isinstance(resp, dict) and bool(resp.get("ok"))
-        return ok, "ok" if ok else "respuesta inválida"
+        return ok, "ok" if ok else "invalid response"
+
+
+def find_ffmpeg(configured=None):
+    """Locate ffmpeg: configured path -> next to this module -> next to the program -> PATH."""
+    name = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
+    candidates = []
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(Path(__file__).resolve().parent / name)
+    if sys.argv and sys.argv[0]:
+        candidates.append(Path(sys.argv[0]).resolve().parent / name)
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    raise RuntimeError("ffmpeg was not found (it should be bundled inside the program).")
+
+
+class _FfmpegWriter:
+    """Pipes raw RGB frames into ffmpeg, which writes a fragmented H.264 MP4."""
+
+    def __init__(self, ffmpeg, path, size, cfg):
+        w, h = size
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+            "-r", f"{float(cfg['fps']):g}", "-i", "-", "-an",
+            "-c:v", "libx264", "-preset", str(cfg["preset"]), "-crf", str(cfg["crf"]),
+            "-g", str(int(cfg["gop_frames"])), "-pix_fmt", "yuv420p",
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            str(path),
+        ]
+        kwargs = {}
+        if sys.platform.startswith("win"):
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW: no console flash
+        self._tail = collections.deque(maxlen=20)
+        try:
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.PIPE, **kwargs)
+        except OSError as e:
+            raise RuntimeError(f"Could not start ffmpeg: {e}")
+        self._drain = threading.Thread(target=self._read_stderr, name="ffmpeg-log", daemon=True)
+        self._drain.start()
+
+    def _read_stderr(self):
+        try:
+            for line in self._proc.stderr:
+                self._tail.append(line.decode("utf-8", "replace").strip())
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def error_tail(self):
+        return " | ".join(t for t in self._tail if t)[-400:]
+
+    def write(self, image):
+        try:
+            self._proc.stdin.write(image.tobytes())
+        except (BrokenPipeError, OSError, ValueError):
+            raise RuntimeError(f"ffmpeg stopped unexpectedly: {self.error_tail or 'no details'}")
+
+    def close(self):
+        """Finish the file. Returns ffmpeg's exit code."""
+        try:
+            self._proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        try:
+            code = self._proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            code = self._proc.wait()
+        self._drain.join(timeout=2)
+        return code
 
 
 def _screen_frame():
-    import pyautogui  # import tardío: el núcleo se puede probar sin pantalla
-    return cv2.cvtColor(np.array(pyautogui.screenshot()), cv2.COLOR_RGB2BGR)
+    from PIL import ImageGrab  # late import: the core can be tested without a display
+    return ImageGrab.grab().convert("RGB")
 
 
 class Recorder:
-    """Graba en un hilo y sube en otro. Se comunica mediante `on_event(kind, data)`.
+    """Records in one thread and uploads in another. Reports via `on_event(kind, data)`.
 
-    Eventos: started, chunk_closed, uploaded, upload_failed, error, finished.
-    `on_event` se llama desde hilos de trabajo; si lo usas desde una interfaz,
-    solo encola el evento y procésalo en el hilo de la interfaz.
+    Events: started, chunk_closed, uploaded, upload_failed, error, finished.
+    `on_event` is called from worker threads; if you use it from a GUI, just
+    queue the event and handle it in the GUI thread.
     """
 
     def __init__(self, cfg, student_id, frame_source=None, on_event=None):
         self.cfg = cfg
         self.student_id = sanitize_id(student_id)
         if not self.student_id:
-            raise ValueError("La matrícula debe tener al menos una letra o un número.")
+            raise ValueError("The student ID must contain at least one letter or digit.")
         self._frame_source = frame_source or _screen_frame
+        self._ffmpeg = find_ffmpeg(cfg["ffmpeg_path"])
         self._on_event = on_event
         self._uploader = Uploader(cfg["upload_url"], cfg["token"], cfg["request_timeout_s"])
         self._stop = threading.Event()
@@ -266,14 +350,14 @@ class Recorder:
     # ---- control -------------------------------------------------------
     def start(self):
         self.cfg["work_dir"].mkdir(parents=True, exist_ok=True)
-        threading.Thread(target=self._capture_loop, name="captura", daemon=True).start()
-        threading.Thread(target=self._upload_loop, name="subida", daemon=True).start()
+        threading.Thread(target=self._capture_loop, name="capture", daemon=True).start()
+        threading.Thread(target=self._upload_loop, name="upload", daemon=True).start()
 
     def stop(self):
         self._stop.set()
         self._wake.set()
 
-    # ---- utilidades internas ------------------------------------------
+    # ---- internals -----------------------------------------------------
     def _emit(self, kind, **data):
         if self._on_event:
             try:
@@ -286,13 +370,14 @@ class Recorder:
             return list(self._pending)
 
     def _grab(self):
-        frame = self._frame_source()
+        frame = self._frame_source().convert("RGB")
         scale = float(self.cfg["scale"])
+        w, h = frame.size
         if scale != 1.0:
-            frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        h, w = frame.shape[:2]
-        if h % 2 or w % 2:  # algunos códecs exigen dimensiones pares
-            frame = frame[: h // 2 * 2, : w // 2 * 2]
+            w, h = max(2, round(w * scale)), max(2, round(h * scale))
+            frame = frame.resize((w, h), Image.Resampling.BOX)
+        if h % 2 or w % 2:  # yuv420p requires even dimensions
+            frame = frame.crop((0, 0, w // 2 * 2, h // 2 * 2))
         return frame
 
     def _chunk_closed(self, path):
@@ -303,7 +388,7 @@ class Recorder:
         self._emit("chunk_closed", path=str(path), pending=pending)
         self._wake.set()
 
-    # ---- captura -------------------------------------------------------
+    # ---- capture -------------------------------------------------------
     def _capture_loop(self):
         writer = None
         path = None
@@ -314,12 +399,14 @@ class Recorder:
 
         def close_writer():
             nonlocal writer
-            if writer is not None:
-                try:
-                    writer.release()
-                finally:
-                    writer = None
-                    self._chunk_closed(path)
+            if writer is None:
+                return
+            w, writer = writer, None
+            code = w.close()
+            if path.is_file() and path.stat().st_size > 0:
+                self._chunk_closed(path)  # even if ffmpeg exited oddly: fragmented MP4 is salvageable
+            else:
+                raise RuntimeError(f"ffmpeg produced no file (exit {code}): {w.error_tail or 'no details'}")
 
         try:
             ip_hex = get_ip_hex()
@@ -328,7 +415,6 @@ class Recorder:
             self.base_name = f"{self.student_id}_{now:%Y-%m-%d_%H-%M-%S}_{ip_hex}"
             self._emit("started", base_name=self.base_name)
 
-            fourcc = cv2.VideoWriter_fourcc(*self.cfg["codec"])
             interval = float(self.cfg["interval_s"])
             chunk_frames = int(self.cfg["chunk_frames"])
             next_t = time.monotonic()
@@ -338,35 +424,28 @@ class Recorder:
                 try:
                     frame = self._grab()
                     errors = 0
-                except Exception as e:  # p. ej. pantalla bloqueada un instante
+                except Exception as e:  # e.g. screen briefly locked
                     errors += 1
                     self.skipped_frames += 1
                     if errors >= 30:
-                        raise RuntimeError(f"No se pudo capturar la pantalla: {e}")
+                        raise RuntimeError(f"Could not capture the screen: {e}")
 
                 if frame is not None:
                     if writer is None:
                         part += 1
-                        path = self.cfg["work_dir"] / f"{self.base_name}_parte{part:03d}.avi"
-                        size = (frame.shape[1], frame.shape[0])
-                        writer = cv2.VideoWriter(str(path), fourcc, float(self.cfg["fps"]), size)
-                        if not writer.isOpened():
-                            writer = None
-                            raise RuntimeError(
-                                f"No se pudo crear el archivo de video en {path}. "
-                                "Revisa que la carpeta sea escribible (rutas con acentos "
-                                "pueden dar problemas en Windows)."
-                            )
+                        path = self.cfg["work_dir"] / f"{self.base_name}_part{part:03d}.mp4"
+                        size = frame.size
+                        writer = _FfmpegWriter(self._ffmpeg, path, size, self.cfg)
                         frames_in_chunk = 0
-                    elif (frame.shape[1], frame.shape[0]) != size:
-                        frame = cv2.resize(frame, size)
+                    elif frame.size != size:
+                        frame = frame.resize(size, Image.Resampling.BOX)
                     writer.write(frame)
                     frames_in_chunk += 1
                     self.frames_total += 1
                     if frames_in_chunk >= chunk_frames:
                         close_writer()
 
-                # Horario fijo: no acumula retraso con el tiempo de captura.
+                # Fixed schedule: does not accumulate drift from capture time.
                 next_t += interval
                 delay = next_t - time.monotonic()
                 if delay > 0:
@@ -377,14 +456,14 @@ class Recorder:
             self._emit("error", message=str(e))
         finally:
             try:
-                close_writer()  # conserva lo grabado hasta el último cuadro
+                close_writer()  # keep everything recorded up to the last frame
             except Exception:
                 pass
             self._stop.set()
             self._capture_done.set()
             self._wake.set()
 
-    # ---- subida --------------------------------------------------------
+    # ---- upload --------------------------------------------------------
     def _upload_one(self, path):
         ok, detail = self._uploader.upload_chunk(self.base_name, path)
         if ok:
@@ -396,7 +475,7 @@ class Recorder:
             try:
                 Path(path).unlink()
             except OSError:
-                pass  # subido igualmente; solo queda una copia local
+                pass  # uploaded anyway; only a local copy remains
             self._emit("uploaded", path=str(path), pending=pending)
         else:
             self._emit("upload_failed", path=str(path), detail=detail,
@@ -438,12 +517,12 @@ class Recorder:
         marker = False
         if self._uploader.enabled and self.base_name and self.chunks_total and not pending:
             info = {
-                "alumno": self.student_id,
-                "inicio": self.started_iso,
-                "fin": datetime.now().isoformat(timespec="seconds"),
-                "partes": self.chunks_total,
-                "cuadros": self.frames_total,
-                "cuadros_omitidos": self.skipped_frames,
+                "student_id": self.student_id,
+                "start": self.started_iso,
+                "end": datetime.now().isoformat(timespec="seconds"),
+                "parts": self.chunks_total,
+                "frames": self.frames_total,
+                "skipped_frames": self.skipped_frames,
             }
             for _ in range(2):
                 marker, _detail = self._uploader.send_final(self.base_name, info)
@@ -453,7 +532,7 @@ class Recorder:
 
         if not pending:
             try:
-                cfg["work_dir"].rmdir()  # solo si está vacía
+                cfg["work_dir"].rmdir()  # only if empty
             except OSError:
                 pass
 

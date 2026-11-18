@@ -1,48 +1,48 @@
-// Receptor de fragmentos para Google Drive (Google Apps Script).
+// Chunk receiver for Google Drive (Google Apps Script).
 //
-// Despliegue: ver README.md. Resumen:
-//   1. Crea una carpeta en tu Drive y copia su ID (lo que va después de /folders/ en la URL).
-//   2. script.google.com > Nuevo proyecto > pega este archivo.
-//   3. Cambia TOKEN y ROOT_FOLDER_ID (TOKEN debe ser igual al de exam_settings.py).
-//   4. Implementar > Nueva implementación > Aplicación web:
-//        Ejecutar como: Yo      Quién tiene acceso: Cualquier persona
-//   5. Copia la URL que termina en /exec a exam_settings.py (UPLOAD_URL).
+// Deployment: see README.md. Summary:
+//   1. Create a folder in your Drive and copy its ID (the part after /folders/ in the URL).
+//   2. script.google.com > New project > paste this file.
+//   3. Set TOKEN and ROOT_FOLDER_ID (TOKEN must match the one in exam_settings.py).
+//   4. Deploy > New deployment > Web app:
+//        Execute as: Me      Who has access: Anyone
+//   5. Copy the URL ending in /exec into exam_settings.py (UPLOAD_URL).
 //
-// Solo AÑADE archivos: nunca borra ni reemplaza nada.
-//  - Reenviar un fragmento idéntico (reintento tras perder la respuesta) no duplica.
-//  - Si llega un fragmento con el mismo nombre pero contenido distinto, se guarda
-//    aparte como *_dup2, *_dup3... y el original queda intacto.
-// Solo acepta carpetas y nombres con la forma exacta que genera el grabador.
+// It only ADDS files: it never deletes or replaces anything.
+//  - Re-sending an identical chunk (a retry after a lost response) does not duplicate it.
+//  - A chunk with the same name but different content is saved separately as
+//    *_dup2, *_dup3... and the original stays untouched.
+// It only accepts folders and file names with the exact shape the recorder generates.
 
-const TOKEN = 'CAMBIA_ESTE_TOKEN';
-const ROOT_FOLDER_ID = 'ID_DE_TU_CARPETA_EN_DRIVE';
-const MAX_BYTES = 45 * 1024 * 1024;  // tope de cordura por fragmento
+const TOKEN = 'CHANGE_THIS_TOKEN';
+const ROOT_FOLDER_ID = 'YOUR_DRIVE_FOLDER_ID';
+const MAX_BYTES = 45 * 1024 * 1024;  // sanity cap per chunk
 
-// matricula_AAAA-MM-DD_HH-MM-SS_IPHEX
+// studentid_YYYY-MM-DD_HH-MM-SS_IPHEX
 const FOLDER_RE = /^[A-Za-z0-9]{1,64}_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[0-9A-F]{8}$/;
 
 function doGet() {
-  return json_({ ok: true, msg: 'receptor activo' });
+  return json_({ ok: true, msg: 'receiver active' });
 }
 
 function doPost(e) {
   try {
     const req = JSON.parse(e.postData.contents);
-    if (req.token !== TOKEN) return json_({ ok: false, error: 'token incorrecto' });
+    if (req.token !== TOKEN) return json_({ ok: false, error: 'wrong token' });
 
     const folderName = String(req.folder || '');
-    if (!FOLDER_RE.test(folderName)) return json_({ ok: false, error: 'carpeta invalida' });
+    if (!FOLDER_RE.test(folderName)) return json_({ ok: false, error: 'invalid folder' });
 
     if (req.action === 'chunk') {
       const name = String(req.name || '');
-      if (!new RegExp('^' + folderName + '_parte\\d{3}\\.avi$').test(name)) {
-        return json_({ ok: false, error: 'nombre invalido' });
+      if (!new RegExp('^' + folderName + '_part\\d{3}\\.mp4$').test(name)) {
+        return json_({ ok: false, error: 'invalid name' });
       }
       const bytes = Utilities.base64Decode(req.data);
       if (bytes.length === 0 || bytes.length > MAX_BYTES) {
-        return json_({ ok: false, error: 'tamano invalido' });
+        return json_({ ok: false, error: 'invalid size' });
       }
-      saveAppendOnly_(getFolder_(folderName), name, bytes, 'video/x-msvideo');
+      saveAppendOnly_(getFolder_(folderName), name, bytes, 'video/mp4');
       return json_({ ok: true, size: bytes.length, md5: md5_(bytes) });
     }
 
@@ -52,7 +52,7 @@ function doPost(e) {
       return json_({ ok: true });
     }
 
-    return json_({ ok: false, error: 'accion desconocida' });
+    return json_({ ok: false, error: 'unknown action' });
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   }
@@ -64,7 +64,7 @@ function getFolder_(folderName) {
   return found.hasNext() ? found.next() : root.createFolder(folderName);
 }
 
-// Guarda sin tocar lo existente. Devuelve true si ya estaba idéntico.
+// Saves without touching what exists. Returns true if an identical file was already there.
 function saveAppendOnly_(folder, name, bytes, mime) {
   const want = md5_(bytes);
   let candidate = name;
@@ -75,7 +75,7 @@ function saveAppendOnly_(folder, name, bytes, mime) {
     while (it.hasNext()) {
       const f = it.next();
       if (f.getSize() === bytes.length && md5_(f.getBlob().getBytes()) === want) {
-        return true;  // mismo contenido: reintento, no duplicar
+        return true;  // same content: a retry, do not duplicate
       }
       clash = true;
     }
