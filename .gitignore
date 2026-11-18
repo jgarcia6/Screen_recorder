@@ -151,3 +151,13 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 *.avi
+
+exam_settings.py
+__pycache__/
+*.avi
+GrabacionExamen/
+build/
+*.build/
+*.dist/
+*.onefile-build/
+*.exe

@@ -12,8 +12,11 @@ La interfaz vive en screen_recorder.py; este módulo no importa tkinter.
 import base64
 import hashlib
 import json
+import os
 import re
 import socket
+import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -31,8 +34,8 @@ DEFAULT_CONFIG = {
     "chunk_frames": 240,         # cuadros por fragmento (240 / 4 fps = 60 s de video)
     "scale": 1.0,                # 0.5 reduce el tamaño de los archivos a ~1/4
     "codec": "XVID",
-    "work_dir": "grabaciones_pendientes",
-    "retry_delay_s": 20,         # espera entre reintentos mientras se graba
+    "work_dir": None,            # None = Descargas\GrabacionExamen (ver resolve_work_dir)
+    "retry_delay_s": 20,        # espera entre reintentos mientras se graba
     "final_attempts": 3,         # pasadas de subida al detener
     "final_wait_s": 5,           # espera entre pasadas al detener
     "final_max_s": 180,          # tiempo máximo total de subida al detener
@@ -47,22 +50,94 @@ _IP_SERVICES = (
 )
 
 
-def load_config(base_dir):
-    """Lee config.json junto al programa y lo mezcla con los valores por defecto."""
-    base_dir = Path(base_dir)
+APP_FOLDER = "GrabacionExamen"
+
+
+def _is_writable_dir(path):
+    try:
+        if not path.is_dir():
+            return False
+        with tempfile.TemporaryFile(dir=path):
+            return True
+    except OSError:
+        return False
+
+
+def _windows_downloads_dir():
+    """Carpeta Descargas real del usuario (puede estar redirigida) según Windows."""
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    # FOLDERID_Downloads = {374DE290-123F-4565-9164-39C4925E467B}
+    folder_id = GUID(0x374DE290, 0x123F, 0x4565,
+                     (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B))
+    shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
+    shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD,
+                                             wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+    shell32.SHGetKnownFolderPath.restype = ctypes.HRESULT  # lanza OSError si falla
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ptr = ctypes.c_void_p()
+    KF_FLAG_DONT_VERIFY = 0x00004000  # no tocar disco/red al resolver; _is_writable_dir lo comprueba
+    shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), KF_FLAG_DONT_VERIFY, None, ctypes.byref(ptr))
+    try:
+        return Path(ctypes.wstring_at(ptr.value))
+    finally:
+        ole32.CoTaskMemFree(ptr)
+
+
+def resolve_work_dir():
+    """Descargas\\GrabacionExamen del usuario actual, con alternativas si no sirve.
+
+    Orden: carpeta Descargas según Windows -> ~/Downloads -> C:\\Users\\Public.
+    Se prefiere una ruta ASCII (OpenCV puede fallar al escribir video en rutas con
+    acentos en Windows); si ninguna ASCII sirve, se usa la primera escribible.
+    """
+    windows = sys.platform.startswith("win")
+    candidates = []
+    if windows:
+        try:
+            candidates.append(_windows_downloads_dir())
+        except Exception:
+            pass
+    candidates.append(Path.home() / "Downloads")
+    candidates.append(Path(os.environ.get("PUBLIC", r"C:\Users\Public")) if windows else Path.home())
+
+    usable = [c for c in candidates if _is_writable_dir(c)]
+    for base in usable:
+        if str(base).isascii():
+            return base / APP_FOLDER
+    if usable:
+        return usable[0] / APP_FOLDER
+    raise RuntimeError("No se encontró una carpeta con permiso de escritura para guardar la grabación.")
+
+
+def _apply(cfg, values, origin):
+    for key, value in values.items():
+        if key not in DEFAULT_CONFIG:
+            raise ValueError(f"Clave desconocida en {origin}: {key!r}")
+        cfg[key] = value
+
+
+def load_config(overrides=None):
+    """Valores por defecto + exam_settings.py (se compila dentro del .exe) + overrides.
+
+    No lee ningún archivo externo: el .exe se distribuye solo.
+    """
     cfg = dict(DEFAULT_CONFIG)
-    path = base_dir / "config.json"
-    if path.exists():
-        with open(path, encoding="utf-8") as f:
-            user = json.load(f)
-        for key, value in user.items():
-            if key.startswith("_"):
-                continue
-            if key not in DEFAULT_CONFIG:
-                raise ValueError(f"Clave desconocida en config.json: {key!r}")
-            cfg[key] = value
-    work = Path(cfg["work_dir"])
-    cfg["work_dir"] = work if work.is_absolute() else base_dir / work
+    try:
+        import exam_settings
+    except ImportError:
+        exam_settings = None
+    if exam_settings is not None:
+        cfg["upload_url"] = getattr(exam_settings, "UPLOAD_URL", "")
+        cfg["token"] = getattr(exam_settings, "TOKEN", "")
+        _apply(cfg, getattr(exam_settings, "OVERRIDES", {}), "exam_settings.OVERRIDES")
+    _apply(cfg, overrides or {}, "overrides")
+    cfg["work_dir"] = resolve_work_dir() if cfg["work_dir"] is None else Path(cfg["work_dir"])
     return cfg
 
 

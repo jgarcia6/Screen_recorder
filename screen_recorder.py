@@ -1,7 +1,7 @@
 """Grabador de examen: ventana pequeña con matrícula, aviso de grabación y botón Detener.
 
 La captura, el troceado y la subida a Drive están en recorder_core.py.
-Configuración: config.json junto a este archivo (o junto al .exe).
+La configuración (URL, token) está en exam_settings.py y se compila dentro del .exe.
 """
 import os
 import queue
@@ -9,19 +9,12 @@ import subprocess
 import sys
 import time
 import tkinter as tk
-from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 from recorder_core import Recorder, load_config, sanitize_id
 
 RED, GREEN, ORANGE, GREY = "#b00020", "#1b7f3b", "#b35c00", "#444444"
-
-
-def base_dir():
-    if getattr(sys, "frozen", False):  # empaquetado con PyInstaller
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent
 
 
 def open_folder(path):
@@ -43,9 +36,9 @@ class App:
         root.resizable(False, False)
 
         try:
-            self.cfg = load_config(base_dir())
+            self.cfg = load_config()
         except Exception as e:
-            messagebox.showerror("Configuración", f"No se pudo leer config.json:\n{e}")
+            messagebox.showerror("Configuración", f"No se pudo preparar la grabación:\n{e}")
             root.destroy()
             raise SystemExit(1)
 
@@ -204,12 +197,13 @@ class App:
             return
         self.pending_dir = s["work_dir"]
         if not s["upload_enabled"]:
-            why = "La subida está desactivada en config.json (modo local)."
+            why = "La subida está desactivada (modo local, sin URL configurada)."
         else:
             why = "No se pudieron subir (revisa tu internet)."
         self.set_status(f"⚠ ATENCIÓN: {len(pending)} fragmento(s) sin subir", RED,
                         f"{why}\nSe conservaron en:\n{s['work_dir']}\n"
-                        "NO borres esa carpeta y avisa a tu profesor.")
+                        "Antes de cerrar sesión o apagar la computadora, avisa a tu profesor. "
+                        "NO borres esa carpeta.")
         self.folder_btn.grid(row=5, column=0, pady=(10, 0), sticky="w")
 
 
