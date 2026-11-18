@@ -153,30 +153,58 @@ def sanitize_id(text):
     return re.sub(r"[^a-zA-Z0-9]", "", text or "")
 
 
-def get_ip_hex(timeout=3.0):
-    """External IP (or internal if offline) as 8 hexadecimal characters."""
-    ip = None
+def _valid_ipv4(text):
+    try:
+        parts = [int(p) for p in (text or "").split(".")]
+    except ValueError:
+        return None
+    if len(parts) == 4 and all(0 <= p <= 255 for p in parts):
+        return ".".join(str(p) for p in parts)
+    return None
+
+
+def get_public_ip(timeout=3.0):
+    """Address the internet sees (the school/home router's, shared by many PCs), or None."""
     for url in _IP_SERVICES:
         try:
             r = requests.get(url, timeout=timeout)
             m = _IPV4.search(r.text)
-            if r.ok and m:
-                ip = m.group(0)
-                break
+            if r.ok and m and _valid_ipv4(m.group(0)):
+                return m.group(0)
         except requests.RequestException:
             continue
-    if ip is None:
-        try:
-            ip = socket.gethostbyname(socket.gethostname())
-        except OSError:
-            ip = None
-    try:
-        parts = [int(p) for p in (ip or "").split(".")]
-        if len(parts) == 4 and all(0 <= p <= 255 for p in parts):
-            return "".join(f"{p:02X}" for p in parts)
-    except ValueError:
+    return None
+
+
+def get_local_ip():
+    """This PC's address on the local network, or None. Never returns loopback."""
+    candidates = []
+    try:  # UDP "connect" sends nothing; it only asks the OS which interface it would use
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            candidates.append(s.getsockname()[0])
+    except OSError:
         pass
-    return "00000000"
+    try:
+        candidates.append(socket.gethostbyname(socket.gethostname()))
+    except OSError:
+        pass
+    for ip in candidates:
+        ip = _valid_ipv4(ip)
+        if ip and not ip.startswith("127.") and ip != "0.0.0.0":
+            return ip
+    return None
+
+
+def get_ips(timeout=3.0):
+    """(public_ip, local_ip); either may be None."""
+    return get_public_ip(timeout), get_local_ip()
+
+
+def ip_to_hex(ip):
+    """IPv4 as 8 hexadecimal characters; 00000000 if unknown."""
+    ip = _valid_ipv4(ip)
+    return "".join(f"{int(p):02X}" for p in ip.split(".")) if ip else "00000000"
 
 
 class Uploader:
@@ -345,6 +373,8 @@ class Recorder:
         self.frames_total = 0
         self.skipped_frames = 0
         self.started_iso = None
+        self.public_ip = None
+        self.local_ip = None
         self.summary = None
 
     # ---- control -------------------------------------------------------
@@ -409,7 +439,8 @@ class Recorder:
                 raise RuntimeError(f"ffmpeg produced no file (exit {code}): {w.error_tail or 'no details'}")
 
         try:
-            ip_hex = get_ip_hex()
+            self.public_ip, self.local_ip = get_ips()
+            ip_hex = ip_to_hex(self.public_ip or self.local_ip)
             now = datetime.now()
             self.started_iso = now.isoformat(timespec="seconds")
             self.base_name = f"{self.student_id}_{now:%Y-%m-%d_%H-%M-%S}_{ip_hex}"
@@ -523,6 +554,8 @@ class Recorder:
                 "parts": self.chunks_total,
                 "frames": self.frames_total,
                 "skipped_frames": self.skipped_frames,
+                "public_ip": self.public_ip,
+                "local_ip": self.local_ip,
             }
             for _ in range(2):
                 marker, _detail = self._uploader.send_final(self.base_name, info)

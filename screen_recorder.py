@@ -171,8 +171,9 @@ class App:
             self.warning = ""
         elif kind == "upload_failed":
             n = data.get("pending", 0)
-            self.warning = (f"⚠ Sin conexión con el servidor: {n} fragmento(s) pendientes. "
-                            "Reintentando… revisa tu internet.")
+            why = " ".join(str(data.get("detail", "")).split())[:140]
+            self.warning = (f"⚠ Problemas al subir: {n} fragmento(s) pendientes. Reintentando… "
+                            f"Último error: {why or 'unknown'}")
         elif kind == "error":
             if self.state in ("starting", "recording"):
                 self.set_state("finishing")  # capture has already stopped; only the upload remains
